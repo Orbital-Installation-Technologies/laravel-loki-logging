@@ -57,6 +57,22 @@ class L3Logger implements HandlerInterface
         $message = $this->formatString($this->format, $recordArray);
         $tags = array_merge($this->context, $recordArray['context']);
         foreach ($tags as $tag => $value) {
+            if (is_array($value)) {
+                $value = json_encode($value);
+            } else if (is_object($value)) {
+                $value = json_encode((array) $value);
+            } else if (is_int($value)) {
+                $value = (string) $value;
+            } else if (is_float($value)) {
+                $value = (string) $value;
+            } else if (is_bool($value)) {
+                $value = (string) $value;
+            } else if (is_null($value)) {
+                $value = 'null';
+            } else {
+                $value = (string) $value;
+            }
+            
             if (is_string($value)) {
                 $tags[$tag] = $this->formatString($value, $recordArray);
             } else {
