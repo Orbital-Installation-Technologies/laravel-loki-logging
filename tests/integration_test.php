@@ -696,6 +696,13 @@ test('logger keeps exceptions and bad label names in the line instead of droppin
     assertSame('y', $extra["job_id\n"]);
 });
 
+test('logger keeps the full text of long values that go in the line', function (): void {
+    $data = logOne(['job.details' => str_repeat('d', 1200), 'note' => str_repeat('n', 1200)]);
+
+    assertTrue(str_contains($data['message'], '"job.details":"'.str_repeat('d', 1200).'"'), 'non-label values are not truncated');
+    assertTrue(str_ends_with($data['tags']['note'], '... [truncated]'), 'labels still are');
+});
+
 test('logger caps labels at 15 and keeps the rest in the line', function (): void {
     $context = [];
     foreach (range(1, 20) as $i) {
@@ -722,6 +729,7 @@ test('logger survives context that throws or cannot be encoded', function (): vo
 
     assertSame('3', $data['tags']['order_id']);
     assertTrue(str_contains($data['message'], '[could not format'));
+    assertTrue(! str_contains($data['message'], 'nope'), 'the formatter exception message must not reach the log line');
     assertTrue(str_contains($data['message'], '\"id\":1') || str_contains($data['message'], '"id":1'));
 });
 

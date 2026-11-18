@@ -80,13 +80,11 @@ class L3Logger implements HandlerInterface
                 continue;
             }
 
-            $value = self::truncateTagValue($this->formatString(
-                $value === null ? 'null' : (string) $value,
-                $recordArray
-            ));
+            $value = $this->formatString($value === null ? 'null' : (string) $value, $recordArray);
 
+            // Only labels need truncating. Values that go in the line keep their full text.
             if (self::isValidLabelName($tag) && (array_key_exists($tag, $tags) || count($tags) < self::MAX_LABELS)) {
-                $tags[$tag] = $value;
+                $tags[$tag] = self::truncateTagValue($value);
             } else {
                 $extra[$tag] = $value;
             }
@@ -192,7 +190,7 @@ class L3Logger implements HandlerInterface
                 default => json_decode(self::encode($value), true) ?? self::encode($value),
             };
         } catch (\Throwable $e) {
-            return sprintf('[could not format %s: %s]', get_debug_type($value), $e->getMessage());
+            return sprintf('[could not format %s: %s thrown]', get_debug_type($value), $e::class);
         }
     }
 
