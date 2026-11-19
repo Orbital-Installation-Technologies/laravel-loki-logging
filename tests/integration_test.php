@@ -482,7 +482,8 @@ test('logger handle appends a valid NDJSON line under lock', function (): void {
     assertTrue(str_ends_with($raw, "\n"));
     $data = json_decode(trim($raw), true);
     assertTrue(is_array($data));
-    assertSame(['app' => 'myapp', 'type' => 'INFO', 'user' => 'bob'], $data['tags']);
+    // This fork turns non-string context into text instead of dropping it.
+    assertSame(['app' => 'myapp', 'type' => 'INFO', 'junk' => '{"not":"string"}', 'user' => 'bob'], $data['tags']);
     assertSame('[INFO] hello', $data['message']);
     assertTrue(is_numeric($data['time']));
     unlink($path);
@@ -561,7 +562,7 @@ test('logger truncates oversized string tags instead of shipping them raw', func
     assertSame('fine', $data['tags']['ok']);
     assertTrue(str_ends_with($data['tags']['big'], '... [truncated]'), 'oversized tag must be marked truncated');
     assertSame(1000 + strlen('... [truncated]'), strlen($data['tags']['big']));
-    assertTrue(! isset($data['tags']['num']), 'non-string tags are still dropped, not stringified');
+    assertSame('7', $data['tags']['num'], 'this fork keeps numbers as text labels');
     unlink($path);
 });
 
