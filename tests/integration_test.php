@@ -703,6 +703,46 @@ test('logger keeps the full text of long values that go in the line', function (
     assertTrue(str_ends_with($data['tags']['note'], '... [truncated]'), 'labels still are');
 });
 
+test('logger keeps a line under Loki\'s size limit even with a huge value', function (): void {
+    $data = logOne(['payload' => ['body' => str_repeat('p', 500_000)]]);
+
+    assertTrue(strlen($data['message']) <= 200_000 + strlen('... [truncated]'), 'line must stay under the cap');
+    assertTrue(str_ends_with($data['message'], '... [truncated]'));
+    assertTrue(str_starts_with($data['message'], '[INFO] boom {"payload":'), 'the start of the line is kept');
+});
+
+test('logger keeps long values past the label limit in the line', function (): void {
+    $context = [];
+    foreach (range(1, 15) as $i) {
+        $context["label_$i"] = "v$i";
+    }
+    $context['label_16'] = str_repeat('z', 1500);
+
+    $data = logOne($context, 'boom', []);
+
+    assertSame(15, count($data['tags']));
+    assertTrue(! isset($data['tags']['label_16']));
+    assertTrue(str_contains($data['message'], '"label_16":"'.str_repeat('z', 1500).'"'), 'value keeps its full text');
+});
+
+test('logger calls jsonSerialize only once per value', function (): void {
+    $counter = new class implements JsonSerializable
+    {
+        public int $calls = 0;
+
+        public function jsonSerialize(): mixed
+        {
+            $this->calls++;
+
+            return null;
+        }
+    };
+
+    logOne(['thing' => $counter]);
+
+    assertSame(1, $counter->calls);
+});
+
 test('logger caps labels at 15 and keeps the rest in the line', function (): void {
     $context = [];
     foreach (range(1, 20) as $i) {

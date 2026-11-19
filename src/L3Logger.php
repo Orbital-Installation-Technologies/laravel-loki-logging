@@ -19,6 +19,12 @@ class L3Logger implements HandlerInterface
     /** Grafana Cloud's limit on labels per stream. */
     private const MAX_LABELS = 15;
 
+    /**
+     * Loki rejects lines over 256 KB by default, and a rejected push drops
+     * every line in its chunk. Keep each line well under that.
+     */
+    private const MAX_LINE_BYTES = 200_000;
+
     private const JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
 
     /** @var resource|\fopen */
@@ -92,6 +98,10 @@ class L3Logger implements HandlerInterface
 
         if ($extra !== []) {
             $message .= ' '.self::encode($extra);
+        }
+
+        if (strlen($message) > self::MAX_LINE_BYTES) {
+            $message = mb_strcut($message, 0, self::MAX_LINE_BYTES, 'UTF-8').'... [truncated]';
         }
 
         $line = json_encode([
@@ -186,12 +196,22 @@ class L3Logger implements HandlerInterface
                 $value instanceof \Stringable => (string) $value,
                 // Round-trip to plain data now, so nothing can throw later
                 // when the whole line is encoded.
-                is_object($value) && ! $value instanceof \JsonSerializable => json_decode(self::encode((array) $value), true),
-                default => json_decode(self::encode($value), true) ?? self::encode($value),
+                default => self::toPlainData(is_object($value) && ! $value instanceof \JsonSerializable ? (array) $value : $value),
             };
         } catch (\Throwable $e) {
             return sprintf('[could not format %s: %s thrown]', get_debug_type($value), $e::class);
         }
+    }
+
+    /**
+     * Encode once (jsonSerialize() can have side effects) and decode back
+     * to plain data, falling back to the JSON text itself.
+     */
+    private static function toPlainData(mixed $value): mixed
+    {
+        $json = self::encode($value);
+
+        return json_decode($json, true) ?? $json;
     }
 
     private static function encode(mixed $value): string
