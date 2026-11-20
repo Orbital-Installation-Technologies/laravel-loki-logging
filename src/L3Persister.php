@@ -18,11 +18,23 @@ class L3Persister extends Command
 
     private const MAX_BUFFER_BYTES = 5000000;
 
-    public function handle(): void
+    private bool $failed = false;
+
+    public function handle(): int
+    {
+        $this->failed = false;
+        $this->push();
+
+        // A non-zero exit shows up as FAIL in the scheduler output, so a
+        // failed or dropped push is visible instead of printing DONE.
+        return $this->failed ? self::FAILURE : self::SUCCESS;
+    }
+
+    private function push(): void
     {
         $server = config('l3.loki.server');
         if (empty($server)) {
-            $this->error('L3Persister: LOG_SERVER is not configured, cannot push to Loki.');
+            $this->reportFailure('L3Persister: LOG_SERVER is not configured, cannot push to Loki.');
 
             return;
         }
@@ -66,13 +78,13 @@ class L3Persister extends Command
                         // labels, samples too old, malformed payload):
                         // drop it and keep shipping the rest instead of
                         // requeueing the whole buffer behind it forever.
-                        $this->error('L3Persister: Dropping chunk rejected by Loki (retrying cannot succeed). Status: '.$response->status());
+                        $this->reportFailure('L3Persister: Dropping chunk rejected by Loki (retrying cannot succeed). Status: '.$response->status());
 
                         continue;
                     }
 
                     $this->requeue($file, array_merge(...array_slice($chunks, $index)));
-                    $this->error('L3Persister: Failed to push logs to Loki. Status: '.$response->status());
+                    $this->reportFailure('L3Persister: Failed to push logs to Loki. Status: '.$response->status());
 
                     return;
                 }
@@ -84,13 +96,13 @@ class L3Persister extends Command
                 $status = $e instanceof RequestException ? $e->response->status() : null;
 
                 if ($status !== null && ! self::isRetryableStatus($status)) {
-                    $this->error('L3Persister: Dropping chunk rejected by Loki (retrying cannot succeed). Status: '.$status);
+                    $this->reportFailure('L3Persister: Dropping chunk rejected by Loki (retrying cannot succeed). Status: '.$status);
 
                     continue;
                 }
 
                 $this->requeue($file, array_merge(...array_slice($chunks, $index)));
-                $this->error('L3Persister: Exception while pushing logs to Loki. '.$e->getMessage());
+                $this->reportFailure('L3Persister: Exception while pushing logs to Loki. '.$e->getMessage());
 
                 return;
             }
@@ -102,6 +114,22 @@ class L3Persister extends Command
      * and server errors are transient; any other 4xx means Loki will
      * reject the chunk on every attempt.
      */
+    /**
+     * Record a failure and report it. With no console attached (the
+     * logger's shutdown flush), writing output throws, so fall back to the
+     * PHP error log instead of aborting the rest of the push.
+     */
+    private function reportFailure(string $message): void
+    {
+        $this->failed = true;
+
+        try {
+            $this->error($message);
+        } catch (\Throwable) {
+            error_log($message);
+        }
+    }
+
     private static function isRetryableStatus(int $status): bool
     {
         return $status === 408 || $status === 429 || $status >= 500;
@@ -190,7 +218,7 @@ class L3Persister extends Command
 
         clearstatcache(true, $file);
         if (file_exists($file) && filesize($file) > self::MAX_BUFFER_BYTES) {
-            $this->error('L3Persister: buffer exceeds size cap, dropping '.count($lines).' unsent lines.');
+            $this->reportFailure('L3Persister: buffer exceeds size cap, dropping '.count($lines).' unsent lines.');
 
             return;
         }

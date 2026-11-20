@@ -482,7 +482,7 @@ test('logger handle appends a valid NDJSON line under lock', function (): void {
     assertTrue(str_ends_with($raw, "\n"));
     $data = json_decode(trim($raw), true);
     assertTrue(is_array($data));
-    // This fork turns non-string context into text instead of dropping it.
+    // This fork keeps small arrays as JSON text labels.
     assertSame(['app' => 'myapp', 'type' => 'INFO', 'junk' => '{"not":"string"}', 'user' => 'bob'], $data['tags']);
     assertSame('[INFO] hello', $data['message']);
     assertTrue(is_numeric($data['time']));
@@ -562,7 +562,7 @@ test('logger truncates oversized string tags instead of shipping them raw', func
     assertSame('fine', $data['tags']['ok']);
     assertTrue(str_ends_with($data['tags']['big'], '... [truncated]'), 'oversized tag must be marked truncated');
     assertSame(1000 + strlen('... [truncated]'), strlen($data['tags']['big']));
-    assertSame('7', $data['tags']['num'], 'this fork keeps numbers as text labels');
+    assertSame('7', $data['tags']['num'], 'numbers stay labels, as text');
     unlink($path);
 });
 
@@ -658,6 +658,190 @@ test('handle still requeues when Loki rate-limits with 429', function (): void {
     assertSame($before, file_get_contents(bufferFile()), 'rate-limited lines must be retried, not dropped');
     assertSame(1, count($persister->errors));
     assertTrue(! str_contains($persister->errors[0], 'Dropping chunk'));
+});
+
+// ---------------------------------------------------------------------------
+// Fork additions: context Loki can't take as a label is kept in the line,
+// label names are checked, and failures exit non-zero.
+// ---------------------------------------------------------------------------
+
+/** Log one record through a fresh logger and return the decoded buffer line. */
+function logOne(array $context, string $message = 'boom', array $config = ['app' => 'myapp']): array
+{
+    $path = tempnam(sys_get_temp_dir(), 'l3log');
+    $file = fopen($path, 'a');
+    newLogger($file, $config)->handle(newRecord($message, $context));
+    fclose($file);
+    $data = json_decode(trim(file_get_contents($path)), true);
+    unlink($path);
+
+    return $data;
+}
+
+test('logger keeps exceptions and bad label names in the line instead of dropping them', function (): void {
+    $data = logOne([
+        'exception' => new RuntimeException('TR Work order not found'),
+        'job.id' => 'abc',
+        0 => 'positional',
+        '__internal' => 'x',
+        "job_id\n" => 'y',
+        'hold_id' => 270386,
+    ]);
+
+    assertSame(['app' => 'myapp', 'hold_id' => '270386'], $data['tags']);
+    $extra = json_decode(substr($data['message'], strlen('[INFO] boom ')), true);
+    assertTrue(str_starts_with($extra['exception'], 'RuntimeException: TR Work order not found at '));
+    assertSame('abc', $extra['job.id']);
+    assertSame('positional', $extra[0]);
+    assertSame('x', $extra['__internal']);
+    assertSame('y', $extra["job_id\n"]);
+});
+
+test('logger keeps the full text of long values that go in the line', function (): void {
+    $data = logOne(['job.details' => str_repeat('d', 1200), 'note' => str_repeat('n', 1200)]);
+
+    assertTrue(str_contains($data['message'], '"job.details":"'.str_repeat('d', 1200).'"'), 'non-label values are not truncated');
+    assertTrue(str_ends_with($data['tags']['note'], '... [truncated]'), 'labels still are');
+});
+
+test('logger keeps a line under Loki\'s size limit even with a huge value', function (): void {
+    $data = logOne(['payload' => ['body' => str_repeat('p', 500_000)]]);
+
+    assertTrue(strlen($data['message']) <= 200_000 + strlen('... [truncated]'), 'line must stay under the cap');
+    assertTrue(str_ends_with($data['message'], '... [truncated]'));
+    assertTrue(str_starts_with($data['message'], '[INFO] boom {"payload":'), 'the start of the line is kept');
+});
+
+test('logger keeps long values past the label limit in the line', function (): void {
+    $context = [];
+    foreach (range(1, 15) as $i) {
+        $context["label_$i"] = "v$i";
+    }
+    $context['label_16'] = str_repeat('z', 1500);
+
+    $data = logOne($context, 'boom', []);
+
+    assertSame(15, count($data['tags']));
+    assertTrue(! isset($data['tags']['label_16']));
+    assertTrue(str_contains($data['message'], '"label_16":"'.str_repeat('z', 1500).'"'), 'value keeps its full text');
+});
+
+test('logger calls jsonSerialize only once per value', function (): void {
+    $counter = new class implements JsonSerializable
+    {
+        public int $calls = 0;
+
+        public function jsonSerialize(): mixed
+        {
+            $this->calls++;
+
+            return null;
+        }
+    };
+
+    // A bad label name sends it to the line, the only path that calls jsonSerialize().
+    logOne(['thing.x' => $counter]);
+
+    assertSame(1, $counter->calls);
+});
+
+test('logger keeps arrays and objects as labels when they fit, like before', function (): void {
+    $data = logOne([
+        'status' => ['code' => 'ok', 'url' => 'a/b'],
+        'point' => (object) ['x' => 1],
+        'big' => ['body' => str_repeat('b', 1200)],
+        'bad.name' => ['k' => 'v'],
+    ]);
+
+    // Same JSON text as before (default json_encode), so existing Grafana queries still match.
+    assertSame('{"code":"ok","url":"a\/b"}', $data['tags']['status']);
+    assertSame('{"x":1}', $data['tags']['point']);
+    assertTrue(! isset($data['tags']['big']) && ! isset($data['tags']['bad.name']));
+    assertTrue(str_contains($data['message'], '"big":{"body":"'.str_repeat('b', 1200).'"}'), 'too long: full JSON in the line');
+    assertTrue(str_contains($data['message'], '"bad.name":{"k":"v"}'), 'bad name: in the line');
+});
+
+test('logger caps labels at 15 and keeps the rest in the line', function (): void {
+    $context = [];
+    foreach (range(1, 20) as $i) {
+        $context["label_$i"] = "value_$i";
+    }
+
+    $data = logOne($context);
+
+    assertSame(15, count($data['tags']));
+    assertSame('value_14', $data['tags']['label_14']);
+    assertTrue(str_contains($data['message'], '"label_15":"value_15"'));
+});
+
+test('logger survives context that throws or cannot be encoded', function (): void {
+    $broken = new class implements Stringable
+    {
+        public function __toString(): string
+        {
+            throw new RuntimeException('nope');
+        }
+    };
+
+    $data = logOne(['thing.x' => $broken, 'data' => ['handle' => fopen('php://memory', 'r'), 'id' => 1], 'order_id' => 3]);
+
+    assertSame('3', $data['tags']['order_id']);
+    assertTrue(str_contains($data['message'], '[could not format'));
+    assertTrue(! str_contains($data['message'], 'nope'), 'the formatter exception message must not reach the log line');
+    assertTrue(str_contains($data['message'], '\"id\":1') || str_contains($data['message'], '"id":1'));
+});
+
+test('logger still writes a line with invalid UTF-8 in it', function (): void {
+    $data = logOne(['reference' => "bad \xB1 bytes"], "also \xB1 bad");
+
+    assertTrue(is_array($data), 'line must not be lost');
+    assertTrue(str_contains($data['message'], 'also'));
+});
+
+test('handle exits 0 when everything was sent', function (): void {
+    freshStorage();
+    resetHttp();
+    Http::fake(['*' => Http::response('', 204)]);
+    file_put_contents(bufferFile(), makeLine(['app' => 'x'], 'm1'));
+
+    assertSame(0, (new TestablePersister)->handle());
+});
+
+test('handle exits non-zero when a push fails or is dropped', function (): void {
+    foreach ([500, 400] as $status) {
+        freshStorage();
+        resetHttp();
+        Http::fake(['*' => Http::response('nope', $status)]);
+        file_put_contents(bufferFile(), makeLine(['app' => 'x'], 'm1'));
+
+        assertSame(1, (new TestablePersister)->handle(), "status $status must not exit 0");
+    }
+});
+
+test('a drop during the shutdown flush does not stop the rest of the buffer', function (): void {
+    freshStorage();
+    resetHttp();
+    // Loki rejects the first chunk every time and takes the second.
+    $calls = 0;
+    Http::fake(function ($request) use (&$calls) {
+        $calls++;
+
+        return str_contains($request->body(), '"m0"') ? Http::response('bad labels', 400) : Http::response('', 204);
+    });
+    $lines = '';
+    for ($i = 0; $i < chunkSize() + 1; $i++) {
+        $lines .= makeLine(['app' => 'x'], "m$i");
+    }
+    file_put_contents(bufferFile(), $lines);
+
+    // A plain persister has no console, like the logger's shutdown flush.
+    $previous = ini_set('error_log', '/dev/null');
+    $exit = (new L3Persister)->handle();
+    ini_set('error_log', (string) $previous);
+
+    assertSame(1, $exit);
+    assertTrue(count(array_filter(Http::recorded()->all(), fn ($pair) => str_contains($pair[0]->body(), '"m'.chunkSize().'"'))) === 1, 'second chunk must still be pushed');
+    assertSame('', file_get_contents(bufferFile()));
 });
 
 // ---------------------------------------------------------------------------

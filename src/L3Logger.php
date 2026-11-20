@@ -16,6 +16,17 @@ class L3Logger implements HandlerInterface
      */
     private const MAX_TAG_VALUE_LENGTH = 1000;
 
+    /** Grafana Cloud's limit on labels per stream. */
+    private const MAX_LABELS = 15;
+
+    /**
+     * Loki rejects lines over 256 KB by default, and a rejected push drops
+     * every line in its chunk. Keep each line well under that.
+     */
+    private const MAX_LINE_BYTES = 200_000;
+
+    private const JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
+
     /** @var resource|\fopen */
     private mixed $file;
 
@@ -62,36 +73,61 @@ class L3Logger implements HandlerInterface
         $this->hasError = $this->hasError || $record->level->value >= Level::Error->value;
         $recordArray = $record->toArray();
         $message = $this->formatString($this->format, $recordArray);
-        $tags = array_merge($this->context, $recordArray['context']);
-        foreach ($tags as $tag => $value) {
-            if (is_array($value)) {
-                $value = json_encode($value);
-            } else if (is_object($value)) {
-                $value = json_encode((array) $value);
-            } else if (is_int($value)) {
-                $value = (string) $value;
-            } else if (is_float($value)) {
-                $value = (string) $value;
-            } else if (is_bool($value)) {
-                $value = (string) $value;
-            } else if (is_null($value)) {
-                $value = 'null';
-            } else {
-                $value = (string) $value;
+        // Context values become labels, so they show up as variables in
+        // Grafana. Anything Loki would reject as a label (exceptions, arrays
+        // or objects too long for a label, names Loki doesn't allow, more
+        // than 15 labels) goes on the end of the log line instead of being
+        // dropped, so it's still searchable.
+        $tags = [];
+        $extra = [];
+        foreach (array_merge($this->context, $recordArray['context']) as $tag => $value) {
+            if ($value instanceof \Throwable) {
+                $extra[$tag] = self::describe($value);
+
+                continue;
             }
-            
-            if (is_string($value)) {
-                $tags[$tag] = self::truncateTagValue($this->formatString($value, $recordArray));
-            } else {
-                unset($tags[$tag]);
+
+            $text = self::labelText($value);
+            $canBeLabel = $text !== null
+                && self::isValidLabelName($tag)
+                && (array_key_exists($tag, $tags) || count($tags) < self::MAX_LABELS);
+
+            if (is_scalar($value) || $value === null) {
+                $text = $this->formatString($text, $recordArray);
+
+                // Only labels need truncating. Values in the line keep their full text.
+                if ($canBeLabel) {
+                    $tags[$tag] = self::truncateTagValue($text);
+                } else {
+                    $extra[$tag] = $text;
+                }
+
+                continue;
             }
+
+            // Arrays and objects stay labels as JSON text when they fit, the
+            // same text this fork always used. Truncated JSON isn't useful,
+            // so longer ones go in the line in full.
+            if ($canBeLabel && mb_strlen($text, 'UTF-8') <= self::MAX_TAG_VALUE_LENGTH) {
+                $tags[$tag] = $this->formatString($text, $recordArray);
+            } else {
+                $extra[$tag] = self::describe($value);
+            }
+        }
+
+        if ($extra !== []) {
+            $message .= ' '.self::encode($extra);
+        }
+
+        if (strlen($message) > self::MAX_LINE_BYTES) {
+            $message = mb_strcut($message, 0, self::MAX_LINE_BYTES, 'UTF-8').'... [truncated]';
         }
 
         $line = json_encode([
             'time' => (int) (microtime(true) * 1000000),
             'tags' => $tags,
             'message' => $message,
-        ])."\n";
+        ], self::JSON_FLAGS)."\n";
 
         if (! flock($this->file, LOCK_EX)) {
             return false;
@@ -148,6 +184,80 @@ class L3Logger implements HandlerInterface
         }
 
         return $message;
+    }
+
+    /**
+     * The label text this fork has always used: strings and numbers as is,
+     * null as "null", arrays and objects as JSON. Null when it can't be made.
+     */
+    private static function labelText(mixed $value): ?string
+    {
+        try {
+            $text = match (true) {
+                $value === null => 'null',
+                is_scalar($value) => (string) $value,
+                is_array($value) => json_encode($value),
+                default => json_encode((array) $value),
+            };
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $text === false ? null : $text;
+    }
+
+    /**
+     * Loki label names must look like identifiers and can't start with "__".
+     */
+    private static function isValidLabelName(int|string $name): bool
+    {
+        return is_string($name)
+            && strlen($name) <= 1024
+            && preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*\z/', $name) === 1
+            && ! str_starts_with($name, '__');
+    }
+
+    /**
+     * Readable text for context that can't be a label. Never throws, so a
+     * broken __toString() or jsonSerialize() doesn't cost us the line.
+     */
+    private static function describe(mixed $value): mixed
+    {
+        try {
+            return match (true) {
+                $value instanceof \Throwable => sprintf(
+                    '%s: %s at %s:%d',
+                    $value::class,
+                    $value->getMessage(),
+                    $value->getFile(),
+                    $value->getLine()
+                ),
+                $value instanceof \Stringable => (string) $value,
+                // Round-trip to plain data now, so nothing can throw later
+                // when the whole line is encoded.
+                default => self::toPlainData(is_object($value) && ! $value instanceof \JsonSerializable ? (array) $value : $value),
+            };
+        } catch (\Throwable $e) {
+            return sprintf('[could not format %s: %s thrown]', get_debug_type($value), $e::class);
+        }
+    }
+
+    /**
+     * Encode once (jsonSerialize() can have side effects) and decode back
+     * to plain data, falling back to the JSON text itself.
+     */
+    private static function toPlainData(mixed $value): mixed
+    {
+        $json = self::encode($value);
+
+        return json_decode($json, true) ?? $json;
+    }
+
+    private static function encode(mixed $value): string
+    {
+        $json = json_encode($value, self::JSON_FLAGS | JSON_PARTIAL_OUTPUT_ON_ERROR);
+
+        return $json === false ? '[could not encode '.get_debug_type($value).']' : $json;
     }
 
     /**
