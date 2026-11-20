@@ -73,26 +73,45 @@ class L3Logger implements HandlerInterface
         $this->hasError = $this->hasError || $record->level->value >= Level::Error->value;
         $recordArray = $record->toArray();
         $message = $this->formatString($this->format, $recordArray);
-        // Simple values (strings, ids, flags) become labels. Anything Loki
-        // would reject as a label (arrays, objects, exceptions, bad names,
-        // too many labels) goes on the end of the log line instead of being
-        // dropped, so the context is still searchable.
+        // Context values become labels, so they show up as variables in
+        // Grafana. Anything Loki would reject as a label (exceptions, arrays
+        // or objects too long for a label, names Loki doesn't allow, more
+        // than 15 labels) goes on the end of the log line instead of being
+        // dropped, so it's still searchable.
         $tags = [];
         $extra = [];
         foreach (array_merge($this->context, $recordArray['context']) as $tag => $value) {
-            if (! is_scalar($value) && $value !== null) {
+            if ($value instanceof \Throwable) {
                 $extra[$tag] = self::describe($value);
 
                 continue;
             }
 
-            $value = $this->formatString($value === null ? 'null' : (string) $value, $recordArray);
+            $text = self::labelText($value);
+            $canBeLabel = $text !== null
+                && self::isValidLabelName($tag)
+                && (array_key_exists($tag, $tags) || count($tags) < self::MAX_LABELS);
 
-            // Only labels need truncating. Values that go in the line keep their full text.
-            if (self::isValidLabelName($tag) && (array_key_exists($tag, $tags) || count($tags) < self::MAX_LABELS)) {
-                $tags[$tag] = self::truncateTagValue($value);
+            if (is_scalar($value) || $value === null) {
+                $text = $this->formatString($text, $recordArray);
+
+                // Only labels need truncating. Values in the line keep their full text.
+                if ($canBeLabel) {
+                    $tags[$tag] = self::truncateTagValue($text);
+                } else {
+                    $extra[$tag] = $text;
+                }
+
+                continue;
+            }
+
+            // Arrays and objects stay labels as JSON text when they fit, the
+            // same text this fork always used. Truncated JSON isn't useful,
+            // so longer ones go in the line in full.
+            if ($canBeLabel && mb_strlen($text, 'UTF-8') <= self::MAX_TAG_VALUE_LENGTH) {
+                $tags[$tag] = $this->formatString($text, $recordArray);
             } else {
-                $extra[$tag] = $value;
+                $extra[$tag] = self::describe($value);
             }
         }
 
@@ -165,6 +184,26 @@ class L3Logger implements HandlerInterface
         }
 
         return $message;
+    }
+
+    /**
+     * The label text this fork has always used: strings and numbers as is,
+     * null as "null", arrays and objects as JSON. Null when it can't be made.
+     */
+    private static function labelText(mixed $value): ?string
+    {
+        try {
+            $text = match (true) {
+                $value === null => 'null',
+                is_scalar($value) => (string) $value,
+                is_array($value) => json_encode($value),
+                default => json_encode((array) $value),
+            };
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $text === false ? null : $text;
     }
 
     /**

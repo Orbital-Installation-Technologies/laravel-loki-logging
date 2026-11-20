@@ -482,8 +482,9 @@ test('logger handle appends a valid NDJSON line under lock', function (): void {
     assertTrue(str_ends_with($raw, "\n"));
     $data = json_decode(trim($raw), true);
     assertTrue(is_array($data));
-    assertSame(['app' => 'myapp', 'type' => 'INFO', 'user' => 'bob'], $data['tags']);
-    assertSame('[INFO] hello {"junk":{"not":"string"}}', $data['message'], 'non-label context goes on the end of the line');
+    // This fork keeps small arrays as JSON text labels.
+    assertSame(['app' => 'myapp', 'type' => 'INFO', 'junk' => '{"not":"string"}', 'user' => 'bob'], $data['tags']);
+    assertSame('[INFO] hello', $data['message']);
     assertTrue(is_numeric($data['time']));
     unlink($path);
 });
@@ -738,9 +739,26 @@ test('logger calls jsonSerialize only once per value', function (): void {
         }
     };
 
-    logOne(['thing' => $counter]);
+    // A bad label name sends it to the line, the only path that calls jsonSerialize().
+    logOne(['thing.x' => $counter]);
 
     assertSame(1, $counter->calls);
+});
+
+test('logger keeps arrays and objects as labels when they fit, like before', function (): void {
+    $data = logOne([
+        'status' => ['code' => 'ok', 'url' => 'a/b'],
+        'point' => (object) ['x' => 1],
+        'big' => ['body' => str_repeat('b', 1200)],
+        'bad.name' => ['k' => 'v'],
+    ]);
+
+    // Same JSON text as before (default json_encode), so existing Grafana queries still match.
+    assertSame('{"code":"ok","url":"a\/b"}', $data['tags']['status']);
+    assertSame('{"x":1}', $data['tags']['point']);
+    assertTrue(! isset($data['tags']['big']) && ! isset($data['tags']['bad.name']));
+    assertTrue(str_contains($data['message'], '"big":{"body":"'.str_repeat('b', 1200).'"}'), 'too long: full JSON in the line');
+    assertTrue(str_contains($data['message'], '"bad.name":{"k":"v"}'), 'bad name: in the line');
 });
 
 test('logger caps labels at 15 and keeps the rest in the line', function (): void {
@@ -765,7 +783,7 @@ test('logger survives context that throws or cannot be encoded', function (): vo
         }
     };
 
-    $data = logOne(['thing' => $broken, 'data' => ['handle' => fopen('php://memory', 'r'), 'id' => 1], 'order_id' => 3]);
+    $data = logOne(['thing.x' => $broken, 'data' => ['handle' => fopen('php://memory', 'r'), 'id' => 1], 'order_id' => 3]);
 
     assertSame('3', $data['tags']['order_id']);
     assertTrue(str_contains($data['message'], '[could not format'));
